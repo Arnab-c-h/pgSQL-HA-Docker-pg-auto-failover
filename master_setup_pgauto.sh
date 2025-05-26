@@ -2,6 +2,7 @@
 set -e # Exit immediately if a command exits with a non-zero status.
 set -o pipefail # If any command in a pipeline fails, that return code will be used as the return code of the whole pipeline.
 
+export PATH=/usr/bin:/usr/local/bin:/snap/bin:$PATH
 # --- Configuration Variables ---
 # Docker Image
 CUSTOM_IMAGE_NAME="pgautofailover-pgsql16-focal"
@@ -46,7 +47,8 @@ PG_AUTOCTL_MONITOR_PASSWORD="monitorpasswordExtremelySecure18309"
 POSTGRES_SUPERUSER_PASSWORD="pg_superuser_VeryStrongP@$$wOrd1!" # For the 'postgres' user
 
 # HBA Configuration & Paths
-CLIENT_IP_FOR_HBA="172.19.0.1" # The IP your host (running psql) appears as to the containers
+#CLIENT_IP_FOR_HBA="172.19.0.1" # The IP your host (running psql) appears as to the containers
+CLIENT_IP_FOR_HBA="0.0.0.0/0"
 DB_USER_FOR_CLIENT_ACCESS="postgres" # The DB user you want to allow from CLIENT_IP_FOR_HBA
 VOL_BASE_PATH_IN_CONTAINER="/pgauto_vol_data" # Base path for data volumes inside container
 PG_CTL_PATH_IN_CONTAINER="/usr/lib/postgresql/16/bin/pg_ctl"
@@ -84,22 +86,55 @@ create_network_if_not_exists() {
 configure_hba_and_reload() {
     local container_name="$1"
     local pgdata_subdir="$2"
+    local specific_ip_for_client_access="$3" 
+    local is_primary_node="$4" 
+
     local pgdata_path_in_container="${VOL_BASE_PATH_IN_CONTAINER}/${pgdata_subdir}"
     local hba_conf_path="${pgdata_path_in_container}/pg_hba.conf"
-    local hba_rule="host    all             ${DB_USER_FOR_CLIENT_ACCESS}      ${CLIENT_IP_FOR_HBA}/32   trust"
-
-    log_info "Configuring pg_hba.conf for ${container_name} to allow ${DB_USER_FOR_CLIENT_ACCESS} from ${CLIENT_IP_FOR_HBA}..."
     
-    # Simple append; cleanup ensures it's fresh on full reruns.
-    # For truly idempotent HBA edits in a running system, one would check/replace.
-    if docker exec "${container_name}" test -f "${hba_conf_path}"; then
-        docker exec "${container_name}" bash -c "echo \"${hba_rule}\" >> \"${hba_conf_path}\""
-        log_info "HBA rule added. Reloading PostgreSQL configuration for ${container_name}..."
-        docker exec -u postgres "${container_name}" "${PG_CTL_PATH_IN_CONTAINER}" reload -D "${pgdata_path_in_container}"
-        log_info "PostgreSQL configuration reloaded for ${container_name}."
-    else
+    log_info "Configuring pg_hba.conf for ${container_name}..."
+    
+    if ! docker exec "${container_name}" test -f "${hba_conf_path}"; then
         log_info "WARNING: ${hba_conf_path} not found in ${container_name}. Skipping HBA config for this node."
+        return
     fi
+
+    # --- Rule for your direct client access (e.g., from host/WSL2/VM itself to the container's mapped port) ---
+    # The DB_USER_FOR_CLIENT_ACCESS is 'postgres' in your case
+    # The specific_ip_for_client_access is what you set CLIENT_IP_FOR_HBA to.
+    # We add /32 to make it a specific host, or if it's "0.0.0.0/0", it stays that way.
+    local client_ip_with_mask="${specific_ip_for_client_access}"
+    if [[ ! "${specific_ip_for_client_access}" == *"/"* ]]; then # if no slash, assume /32 for single IP
+        client_ip_with_mask="${specific_ip_for_client_access}/32"
+    fi
+    local hba_client_access_rule="host    all             ${DB_USER_FOR_CLIENT_ACCESS}      ${client_ip_with_mask}   trust"
+    
+    log_info "Adding client access HBA rule to ${container_name}: ${hba_client_access_rule}"
+    docker exec "${container_name}" bash -c "echo \"${hba_client_access_rule}\" >> \"${hba_conf_path}\""
+
+    # --- Rules for Replication (only if this node is the initial primary) ---
+    if [ "$is_primary_node" = true ]; then
+        log_info "Node ${container_name} is initial primary. Adding replication HBA rules for Docker network ${DOCKER_NETWORK_CIDR}..."
+        
+        # Allows the 'pgautofailover_replicator' user (created internally by pg_autoctl)
+        # to connect for replication purposes from any IP within the Docker network.
+        # The logs showed it trying to connect to 'database "myappdb"', so we allow 'all' databases for this user.
+        local hba_repl_user_rule1="host    replication     pgautofailover_replicator ${DOCKER_NETWORK_CIDR}           trust"
+        local hba_repl_user_rule2="host    all             pgautofailover_replicator ${DOCKER_NETWORK_CIDR}           trust"
+        
+        # Also allow the 'postgres' user (your --username for pg_autoctl create) for replication.
+        # Under '--auth trust', pg_auto_failover might also try to use this user for some replication setup steps.
+        local hba_postgres_repl_rule="host   replication     postgres        ${DOCKER_NETWORK_CIDR}           trust"
+
+        docker exec "${container_name}" bash -c "echo \"${hba_repl_user_rule1}\" >> \"${hba_conf_path}\""
+        docker exec "${container_name}" bash -c "echo \"${hba_repl_user_rule2}\" >> \"${hba_conf_path}\""
+        docker exec "${container_name}" bash -c "echo \"${hba_postgres_repl_rule}\" >> \"${hba_conf_path}\""
+        log_info "Replication HBA rules added to ${container_name}."
+    fi
+    
+    log_info "Reloading PostgreSQL configuration for ${container_name}..."
+    docker exec -u postgres "${container_name}" "${PG_CTL_PATH_IN_CONTAINER}" reload -D "${pgdata_path_in_container}"
+    log_info "PostgreSQL configuration reloaded for ${container_name}."
 }
 
 # Function to set postgres superuser password
@@ -181,7 +216,7 @@ ENV LC_ALL C.UTF-8
 
 # 1. Install prerequisites, gosu, and common utils
 ENV GOSU_VERSION=1.17
-ENV TARGETARCH=amd64 # Adjust if on a different architecture like arm64
+ENV TARGETARCH=amd64 
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
@@ -204,17 +239,24 @@ RUN apt-get update && \
     rm /usr/local/bin/gosu.asc && \
     chmod +x /usr/local/bin/gosu && \
     gosu --version && \
-    apt-get purge -y --auto-remove wget gnupg && \
     rm -rf /var/lib/apt/lists/*
 
 # 2. Add PostgreSQL APT Repository
-RUN curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | gpg --dearmor -o /usr/share/keyrings/postgresql-archive-keyring.gpg && \
-    echo "deb [signed-by=/usr/share/keyrings/postgresql-archive-keyring.gpg] http://apt.postgresql.org/pub/repos/apt/ \$(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list
+# RUN curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | gpg --dearmor -o /usr/share/keyrings/postgresql-archive-keyring.gpg && \
+#     echo "deb [signed-by=/usr/share/keyrings/postgresql-archive-keyring.gpg] http://apt.postgresql.org/pub/repos/apt/ \$(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list
+RUN apt-get update && apt-get install -y gnupg curl ca-certificates lsb-release wget --no-install-recommends && \
+    install -m 0755 -d /etc/apt/keyrings && \
+    curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc -o /tmp/ACCC4CF8.asc && \
+    gpg --dearmor --yes -o /etc/apt/keyrings/postgresql-archive-keyring.gpg /tmp/ACCC4CF8.asc && \
+    chmod a+r /etc/apt/keyrings/postgresql-archive-keyring.gpg && \
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/postgresql-archive-keyring.gpg] http://apt.postgresql.org/pub/repos/apt/ $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list && \
+    rm /tmp/ACCC4CF8.asc && \
+    apt-get autoremove -y --purge gnupg curl wget && \ 
+    rm -rf /var/lib/apt/lists/* 
 
 # 3. Install PostgreSQL 16 and pg_auto_failover packages
 RUN apt-get update && \
     apt-get install -y --no-install-recommends postgresql-common && \
-    # Prevent auto-creation of a main cluster by the package installation
     sed -ri 's/#(create_main_cluster) .*$/\1 = false/' /etc/postgresql-common/createcluster.conf && \
     apt-get install -y --no-install-recommends \
         postgresql-16 \
@@ -280,6 +322,16 @@ cleanup # Clean up previous run
 build_docker_image # Build image if it doesn't exist
 create_network_if_not_exists
 
+log_info "Attempting to dynamically determine CIDR for Docker network ${DOCKER_NETWORK_NAME}..."
+DOCKER_NETWORK_CIDR=$(docker network inspect "${DOCKER_NETWORK_NAME}" --format '{{range .IPAM.Config}}{{.Subnet}}{{end}}')
+
+if [ -z "${DOCKER_NETWORK_CIDR}" ]; then
+    log_error "Could not determine CIDR for Docker network '${DOCKER_NETWORK_NAME}'. Please ensure the network exists and inspect manually."
+    log_error "You might need to run 'docker network create ${DOCKER_NETWORK_NAME}' if it wasn't created."
+    exit 1
+fi
+log_info "Successfully determined Docker network CIDR: ${DOCKER_NETWORK_CIDR}"
+
 # 1. Start Monitor Node
 log_info "--- Starting Monitor Node (${MONITOR_CONTAINER_NAME}) ---"
 MONITOR_ACTUAL_PGDATA_IN_CONTAINER="${VOL_BASE_PATH_IN_CONTAINER}/${MONITOR_PGDATA_SUBDIR}"
@@ -341,7 +393,7 @@ docker run \
 
 log_info "Waiting for ${PGNODE1_CONTAINER_NAME} to initialize and register (50 seconds)..."
 sleep 50
-configure_hba_and_reload "${PGNODE1_CONTAINER_NAME}" "${NODE_PGDATA_SUBDIR}"
+configure_hba_and_reload "${PGNODE1_CONTAINER_NAME}" "${NODE_PGDATA_SUBDIR}" "${CLIENT_IP_FOR_HBA}" true 
 set_postgres_superuser_password "${PGNODE1_CONTAINER_NAME}" "${DB_NAME}"
 
 
@@ -373,7 +425,7 @@ docker run \
 
 log_info "Waiting for ${PGNODE2_CONTAINER_NAME} to initialize and sync (65 seconds)..."
 sleep 65
-configure_hba_and_reload "${PGNODE2_CONTAINER_NAME}" "${NODE_PGDATA_SUBDIR}"
+configure_hba_and_reload "${PGNODE2_CONTAINER_NAME}" "${NODE_PGDATA_SUBDIR}" "${CLIENT_IP_FOR_HBA}" false
 
 
 # --- pgnode3 (Initial Standby 2) ---
@@ -404,7 +456,7 @@ docker run \
 
 log_info "Waiting for ${PGNODE3_CONTAINER_NAME} to initialize and sync (65 seconds)..."
 sleep 65
-configure_hba_and_reload "${PGNODE3_CONTAINER_NAME}" "${NODE_PGDATA_SUBDIR}"
+configure_hba_and_reload "${PGNODE3_CONTAINER_NAME}" "${NODE_PGDATA_SUBDIR}" "${CLIENT_IP_FOR_HBA}" false
 
 
 # --- Final Status Check ---
